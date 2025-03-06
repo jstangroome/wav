@@ -58,6 +58,34 @@ func (e *Encoder) AddLE(src interface{}) error {
 	return binary.Write(e.w, binary.LittleEndian, src)
 }
 
+// insertLE serializes the passed value using little endian at at specified
+// offset within the writer and restores the seek position  without affecting
+// WrittenBytes.
+func (e *Encoder) insertLE(src interface{}, offset int64) (out error) {
+	if !e.wroteHeader {
+		return fmt.Errorf("cannot insert before header has been written")
+	}
+	originalOffset, err := e.w.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return fmt.Errorf("failed to query current seek offset: %w", err)
+	}
+	_, err = e.w.Seek(offset, io.SeekStart)
+	if err != nil {
+		return fmt.Errorf("failed to seek to offset %d: %w", offset, err)
+	}
+
+	// always restore the seek offset to the original position
+	defer func() {
+		_, deferErr := e.w.Seek(originalOffset, io.SeekStart)
+		if out == nil {
+			out = deferErr
+		}
+	}()
+
+	out = binary.Write(e.w, binary.LittleEndian, src)
+	return out
+}
+
 // AddBE serializes and adds the passed value using big endian
 func (e *Encoder) AddBE(src interface{}) error {
 	e.WrittenBytes += binary.Size(src)
@@ -233,6 +261,36 @@ func (e *Encoder) writeMetadata() error {
 	return e.AddBE(chunkData)
 }
 
+// WriteCurrentSize updates the file and chunk headers with the length of the
+// data written to the file so far to enable consumption of partially written
+// audio mid-stream. However it is important to consume the data after calling
+// WriteCurrentSize but before any further audio data is written.
+// Additionally, metadata will not be present in the partial data.
+func (e *Encoder) WriteCurrentSize() error {
+	// total size immediately follows the "RIFF" header, i.e. offset 4.
+	totalSizeOffset := binary.Size(riff.RiffID)
+
+	// total size is the bytes written, less the "RIFF" header and the size
+	// value itself, i.e. minus 8.
+	var totalSizeValue uint32
+	totalSizeValue = uint32(e.WrittenBytes - totalSizeOffset - binary.Size(totalSizeValue))
+
+	// go back and write total size in header
+	if err := e.insertLE(totalSizeValue, int64(totalSizeOffset)); err != nil {
+		return fmt.Errorf("%w when writing the total written bytes", err)
+	}
+
+	// rewrite the audio chunk length header
+	if e.pcmChunkSizePos > 0 {
+		chunksize := uint32((int(e.BitDepth) / 8) * int(e.NumChans) * e.frames)
+		if err := e.insertLE(uint32(chunksize), int64(e.pcmChunkSizePos)); err != nil {
+			return fmt.Errorf("%w when writing wav data chunk size header", err)
+		}
+	}
+
+	return nil
+}
+
 // Close flushes the content to disk, make sure the headers are up to date
 // Note that the underlying writer is NOT being closed.
 func (e *Encoder) Close() error {
@@ -248,27 +306,12 @@ func (e *Encoder) Close() error {
 		}
 	}
 
-	// go back and write total size in header
-	if _, err := e.w.Seek(4, 0); err != nil {
+	if err := e.WriteCurrentSize(); err != nil {
 		return err
-	}
-	if err := e.AddLE(uint32(e.WrittenBytes) - 8); err != nil {
-		return fmt.Errorf("%w when writing the total written bytes", err)
-	}
-
-	// rewrite the audio chunk length header
-	if e.pcmChunkSizePos > 0 {
-		if _, err := e.w.Seek(int64(e.pcmChunkSizePos), 0); err != nil {
-			return err
-		}
-		chunksize := uint32((int(e.BitDepth) / 8) * int(e.NumChans) * e.frames)
-		if err := e.AddLE(uint32(chunksize)); err != nil {
-			return fmt.Errorf("%w when writing wav data chunk size header", err)
-		}
 	}
 
 	// jump back to the end of the file.
-	if _, err := e.w.Seek(0, 2); err != nil {
+	if _, err := e.w.Seek(0, io.SeekEnd); err != nil {
 		return err
 	}
 	switch e.w.(type) {

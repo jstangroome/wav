@@ -1,9 +1,12 @@
 package wav
 
 import (
+	"math"
 	"os"
 	"path"
+	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestEncoderRoundTrip(t *testing.T) {
@@ -155,4 +158,90 @@ func TestEncoderRoundTrip(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestEncoder_UseBeforeClose(t *testing.T) {
+	testpath := filepath.Join(t.TempDir(), "test.wav")
+	f, err := os.Create(testpath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	const sampleRateHz = 8000
+	const bitDepth = 16
+	const bitsPerByte = 8
+	const bytesPerFrame = bitDepth / bitsPerByte
+	enc := NewEncoder(f, sampleRateHz, bitDepth, 1, 1)
+
+	writeOneSecond := func() {
+		frameBuf := make([]byte, bytesPerFrame)
+		for i := 0; i < sampleRateHz; i++ {
+			enc.WriteFrame(frameBuf)
+		}
+	}
+
+	sync := func() {
+		err = f.Sync()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	getDuration := func() time.Duration {
+		r, err := os.Open(testpath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer r.Close()
+
+		dec := NewDecoder(r)
+		dur, err := dec.Duration()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return dur
+	}
+
+	assertNotWithin := func(msg string, got, want, within float64) {
+		isWithin := math.Abs(got-want) <= within
+		if isWithin {
+			t.Errorf("%s: got %f, wanted not %f (within %f)", msg, got, want, within)
+		}
+	}
+
+	assertWithin := func(msg string, got, want, within float64) {
+		isWithin := math.Abs(got-want) <= within
+		if !isWithin {
+			t.Errorf("%s: got %f, wanted %f (within %f)", msg, got, want, within)
+		}
+	}
+
+	// duration should be undefined before explicit call to WriteCurrentSize or Close
+	writeOneSecond()
+	sync()
+	dur := getDuration()
+	assertNotWithin("before WriteCurrentSize()", dur.Seconds(), 1.0, 0.5)
+
+	// duration should be correct after WriteCurrentSize
+	err = enc.WriteCurrentSize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dur = getDuration()
+	assertWithin("after WriteCurrentSize()", dur.Seconds(), 1.0, 0.5)
+
+	// duration should be outdated after writing more audio data
+	writeOneSecond()
+	sync()
+	dur = getDuration()
+	assertWithin("after another second", dur.Seconds(), 1.0, 0.5)
+
+	// duration should be correct after Close
+	err = enc.Close()
+	if err != nil {
+		t.Fatalf("Encoder.Close() = %v", err)
+	}
+	dur = getDuration()
+	assertWithin("after Encoder.Close()", dur.Seconds(), 2.0, 0.5)
 }
